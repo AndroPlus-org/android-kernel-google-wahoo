@@ -77,7 +77,7 @@ DATE_START=$(date +"%s")
 
 echo -e "${green}"
 echo "-----------------"
-echo "Making snoke Kernel:"
+echo "Making AndroPlus Kernel:"
 echo "-----------------"
 echo -e "${restore}"
 
