@@ -30,6 +30,7 @@ PATCH_DIR=/mnt/ssd/home/android/wahoo/tools/AnyKernel2/patch
 MODULES_DIR=/mnt/ssd/home/android/wahoo/tools/AnyKernel2/modules
 ZIP_MOVE=/mnt/ssd/home/android/wahoo/tools/out/
 ZIMAGE_DIR=${KERNEL_DIR}/arch/arm64/boot
+MYDESKTOP=/mnt/hgfs/VMShare/desktop
 
 # Functions
 function clean_all {
@@ -67,7 +68,9 @@ function make_boot {
 function make_zip {
 		cd ${REPACK_DIR}
 		zip -r9 `echo $AK_VER`.zip *
+		dd if=`echo $AK_VER`.zip of=$MYDESKTOP/`echo $AK_VER`.zip
 		mv  `echo $AK_VER`.zip $ZIP_MOVE
+		
 		cd $KERNEL_DIR
 }
 
