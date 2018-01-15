@@ -20,7 +20,7 @@ export CROSS_COMPILE=~/aarch64-linux-android-4.9-aosp/bin/aarch64-linux-android-
 DEFCONFIG="flash_defconfig"
 
 # Kernel Details
-VER=".v02"
+VER=".v03"
 
 # Paths
 KERNEL_DIR=`pwd`
