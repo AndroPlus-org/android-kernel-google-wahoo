@@ -12,7 +12,7 @@ clear
 THREAD="-j$(grep -c ^processor /proc/cpuinfo)"
 KERNEL="Image"
 DTBIMAGE="dtb"
-export CLANG_PATH=/mnt/ssd/home/android/wahoo/tools/linux-x86/clang-4536805/bin/
+export CLANG_PATH=/mnt/ssd/home/android/wahoo/tools/linux-x86/clang-4556391/bin/
 export PATH=${CLANG_PATH}:${PATH}
 export LD_LIBRARY_PATH=:${LD_LIBRARY_PATH}
 export CLANG_TRIPLE=aarch64-linux-gnu-
@@ -20,7 +20,7 @@ export CROSS_COMPILE=~/aarch64-linux-android-4.9-aosp/bin/aarch64-linux-android-
 DEFCONFIG="flash_defconfig"
 
 # Kernel Details
-VER=".v03"
+VER=".v04"
 
 # Paths
 KERNEL_DIR=`pwd`
