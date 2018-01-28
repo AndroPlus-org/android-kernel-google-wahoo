@@ -63,7 +63,9 @@ unsigned long arch_mmap_rnd(void)
 static unsigned long mmap_base(unsigned long rnd)
 {
 	unsigned long gap = rlimit(RLIMIT_STACK);
-	unsigned long pad = STACK_RND_MASK << PAGE_SHIFT;
+	unsigned long pad = (STACK_RND_MASK << PAGE_SHIFT) + stack_guard_gap;
+
+	/* Values close to RLIM_INFINITY can overflow. */
 	if (gap + pad > gap)
 		gap += pad;
 

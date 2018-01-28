@@ -34,6 +34,7 @@
 #include <linux/stacktrace.h>
 #include <linux/prefetch.h>
 #include <linux/memcontrol.h>
+#include <linux/random.h>
 
 #include <trace/events/kmem.h>
 
@@ -122,6 +123,16 @@ static inline int kmem_cache_debug(struct kmem_cache *s)
 #else
 	return 0;
 #endif
+}
+
+static inline bool has_sanitize(struct kmem_cache *s)
+{
+	return IS_ENABLED(CONFIG_SLAB_SANITIZE) && !(s->flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON));
+}
+
+static inline bool has_sanitize_verify(struct kmem_cache *s)
+{
+	return IS_ENABLED(CONFIG_SLAB_SANITIZE_VERIFY) && has_sanitize(s);
 }
 
 void *fixup_red_left(struct kmem_cache *s, void *p)
@@ -232,32 +243,92 @@ static inline void stat(const struct kmem_cache *s, enum stat_item si)
  * 			Core slab cache functions
  *******************************************************************/
 
+/*
+ * Returns freelist pointer (ptr). With hardening, this is obfuscated
+ * with an XOR of the address where the pointer is held and a per-cache
+ * random number.
+ */
+static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr,
+				 unsigned long ptr_addr)
+{
+#ifdef CONFIG_SLAB_FREELIST_HARDENED
+	return (void *)((unsigned long)ptr ^ s->random ^ ptr_addr);
+#else
+	return ptr;
+#endif
+}
+
+/* Returns the freelist pointer recorded at location ptr_addr. */
+static inline void *freelist_dereference(const struct kmem_cache *s,
+					 void *ptr_addr)
+{
+	return freelist_ptr(s, (void *)*(unsigned long *)(ptr_addr),
+			    (unsigned long)ptr_addr);
+}
+
 static inline void *get_freepointer(struct kmem_cache *s, void *object)
 {
-	return *(void **)(object + s->offset);
+	return freelist_dereference(s, object + s->offset);
 }
 
 static void prefetch_freepointer(const struct kmem_cache *s, void *object)
 {
-	prefetch(object + s->offset);
+	if (object)
+		prefetch(freelist_dereference(s, object + s->offset));
 }
 
 static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
 {
+	unsigned long freepointer_addr;
 	void *p;
 
-#ifdef CONFIG_DEBUG_PAGEALLOC
-	probe_kernel_read(&p, (void **)(object + s->offset), sizeof(p));
-#else
-	p = get_freepointer(s, object);
-#endif
-	return p;
+	if (!debug_pagealloc_enabled())
+		return get_freepointer(s, object);
+
+	freepointer_addr = (unsigned long)object + s->offset;
+	probe_kernel_read(&p, (void **)freepointer_addr, sizeof(p));
+	return freelist_ptr(s, p, freepointer_addr);
 }
 
 static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
 {
-	*(void **)(object + s->offset) = fp;
+	unsigned long freeptr_addr = (unsigned long)object + s->offset;
+
+#ifdef CONFIG_SLAB_FREELIST_HARDENED
+	BUG_ON(object == fp); /* naive detection of double free or corruption */
+#endif
+
+	*(void **)freeptr_addr = freelist_ptr(s, fp, freeptr_addr);
 }
+
+#ifdef CONFIG_SLAB_CANARY
+static inline unsigned long *get_canary(struct kmem_cache *s, void *object)
+{
+	if (s->offset)
+		return object + s->offset + sizeof(void *);
+	return object + s->inuse;
+}
+
+static inline unsigned long get_canary_value(const void *canary, unsigned long value)
+{
+	return (value ^ (unsigned long)canary) & CANARY_MASK;
+}
+
+static inline void set_canary(struct kmem_cache *s, void *object, unsigned long value)
+{
+	unsigned long *canary = get_canary(s, object);
+	*canary = get_canary_value(canary, value);
+}
+
+static inline void check_canary(struct kmem_cache *s, void *object, unsigned long value)
+{
+	unsigned long *canary = get_canary(s, object);
+	BUG_ON(*canary != get_canary_value(canary, value));
+}
+#else
+#define set_canary(s, object, value)
+#define check_canary(s, object, value)
+#endif
 
 /* Loop over all objects in a slab */
 #define for_each_object(__p, __s, __addr, __objects) \
@@ -509,6 +580,9 @@ static struct track *get_track(struct kmem_cache *s, void *object,
 	else
 		p = object + s->inuse;
 
+	if (IS_ENABLED(CONFIG_SLAB_CANARY))
+		p = (void *)p + sizeof(void *);
+
 	return p + alloc;
 }
 
@@ -645,6 +719,9 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 		off = s->offset + sizeof(void *);
 	else
 		off = s->inuse;
+
+	if (IS_ENABLED(CONFIG_SLAB_CANARY))
+		off += sizeof(void *);
 
 	if (s->flags & SLAB_STORE_USER)
 		off += 2 * sizeof(struct track);
@@ -784,6 +861,9 @@ static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
 
 	if (s->offset)
 		/* Freepointer is placed after the object. */
+		off += sizeof(void *);
+
+	if (IS_ENABLED(CONFIG_SLAB_CANARY))
 		off += sizeof(void *);
 
 	if (s->flags & SLAB_STORE_USER)
@@ -1366,8 +1446,9 @@ static void setup_object(struct kmem_cache *s, struct page *page,
 				void *object)
 {
 	setup_object_debug(s, page, object);
+	set_canary(s, object, s->random_inactive);
 	kasan_init_slab_obj(s, object);
-	if (unlikely(s->ctor)) {
+	if (unlikely(s->ctor) && !has_sanitize_verify(s)) {
 		kasan_unpoison_object_data(s, object);
 		s->ctor(object);
 		kasan_poison_object_data(s, object);
@@ -1404,6 +1485,10 @@ static int init_cache_random_seq(struct kmem_cache *s)
 {
 	int err;
 	unsigned long i, count = oo_objects(s->oo);
+
+	/* Bailout if already initialised */
+	if (s->random_seq)
+		return 0;
 
 	err = cache_random_seq_create(s, count, GFP_KERNEL);
 	if (err) {
@@ -2667,8 +2752,20 @@ redo:
 		stat(s, ALLOC_FASTPATH);
 	}
 
-	if (unlikely(gfpflags & __GFP_ZERO) && object)
+	if (has_sanitize_verify(s) && object) {
+		size_t offset = s->offset ? 0 : sizeof(void *);
+		BUG_ON(memchr_inv(object + offset, 0, s->object_size - offset));
+		if (s->ctor)
+			s->ctor(object);
+		if (unlikely(gfpflags & __GFP_ZERO) && offset)
+			memset(object, 0, sizeof(void *));
+	} else if (unlikely(gfpflags & __GFP_ZERO) && object)
 		memset(object, 0, s->object_size);
+
+	if (object) {
+		check_canary(s, object, s->random_inactive);
+		set_canary(s, object, s->random_active);
+	}
 
 	slab_post_alloc_hook(s, gfpflags, 1, &object);
 
@@ -2877,6 +2974,27 @@ static __always_inline void do_slab_free(struct kmem_cache *s,
 	void *tail_obj = tail ? : head;
 	struct kmem_cache_cpu *c;
 	unsigned long tid;
+	bool sanitize = has_sanitize(s);
+
+	if (IS_ENABLED(CONFIG_SLAB_CANARY) || sanitize) {
+		__maybe_unused int offset = s->offset ? 0 : sizeof(void *);
+		void *x = head;
+
+		while (1) {
+			check_canary(s, x, s->random_active);
+			set_canary(s, x, s->random_inactive);
+
+			if (sanitize) {
+				memset(x + offset, 0, s->object_size - offset);
+				if (!IS_ENABLED(CONFIG_SLAB_SANITIZE_VERIFY) && s->ctor)
+					s->ctor(x);
+			}
+			if (x == tail_obj)
+				break;
+			x = get_freepointer(s, x);
+		}
+	}
+
 redo:
 	/*
 	 * Determine the currently cpus per cpu slab.
@@ -3040,7 +3158,7 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 			  void **p)
 {
 	struct kmem_cache_cpu *c;
-	int i;
+	int i, k;
 
 	/* memcg and kmem_cache debug support */
 	s = slab_pre_alloc_hook(s, flags);
@@ -3077,11 +3195,27 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 	local_irq_enable();
 
 	/* Clear memory outside IRQ disabled fastpath loop */
-	if (unlikely(flags & __GFP_ZERO)) {
+	if (has_sanitize_verify(s)) {
+		int j;
+
+		for (j = 0; j < i; j++) {
+			size_t offset = s->offset ? 0 : sizeof(void *);
+			BUG_ON(memchr_inv(p[j] + offset, 0, s->object_size - offset));
+			if (s->ctor)
+				s->ctor(p[j]);
+			if (unlikely(flags & __GFP_ZERO) && offset)
+				memset(p[j], 0, sizeof(void *));
+		}
+	} else if (unlikely(flags & __GFP_ZERO)) {
 		int j;
 
 		for (j = 0; j < i; j++)
 			memset(p[j], 0, s->object_size);
+	}
+
+	for (k = 0; k < i; k++) {
+		check_canary(s, p[k], s->random_inactive);
+		set_canary(s, p[k], s->random_active);
 	}
 
 	/* memcg and kmem_cache debug support */
@@ -3287,6 +3421,7 @@ static void early_kmem_cache_node_alloc(int node)
 	init_object(kmem_cache_node, n, SLUB_RED_ACTIVE);
 	init_tracking(kmem_cache_node, n);
 #endif
+	set_canary(kmem_cache_node, n, kmem_cache_node->random_active);
 	kasan_kmalloc(kmem_cache_node, n, sizeof(struct kmem_cache_node),
 		      GFP_KERNEL);
 	init_kmem_cache_node(n);
@@ -3410,6 +3545,9 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		size += sizeof(void *);
 	}
 
+	if (IS_ENABLED(CONFIG_SLAB_CANARY))
+		size += sizeof(void *);
+
 #ifdef CONFIG_SLUB_DEBUG
 	if (flags & SLAB_STORE_USER)
 		/*
@@ -3477,6 +3615,13 @@ static int kmem_cache_open(struct kmem_cache *s, unsigned long flags)
 {
 	s->flags = kmem_cache_flags(s->size, flags, s->name, s->ctor);
 	s->reserved = 0;
+#ifdef CONFIG_SLAB_FREELIST_HARDENED
+	s->random = get_random_long();
+#endif
+#ifdef CONFIG_SLAB_CANARY
+	s->random_active = get_random_long();
+	s->random_inactive = get_random_long();
+#endif
 
 	if (need_reserve_slab_rcu && (s->flags & SLAB_DESTROY_BY_RCU))
 		s->reserved = sizeof(struct rcu_head);
@@ -3763,6 +3908,8 @@ const char *__check_heap_object(const void *ptr, unsigned long n,
 		offset -= s->red_left_pad;
 	}
 
+	check_canary(s, (void *)ptr - offset, s->random_active);
+
 	/* Allow address range falling entirely within object size. */
 	if (offset <= object_size && n <= object_size - offset)
 		return NULL;
@@ -3781,7 +3928,11 @@ static size_t __ksize(const void *object)
 	page = virt_to_head_page(object);
 
 	if (unlikely(!PageSlab(page))) {
+#ifdef CONFIG_PANIC_ON_DATA_CORRUPTION
+		BUG_ON(!PageCompound(page));
+#else
 		WARN_ON(!PageCompound(page));
+#endif
 		return PAGE_SIZE << compound_order(page);
 	}
 
